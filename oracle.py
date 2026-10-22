@@ -67,14 +67,19 @@ def fetch_news():
     start = today - timedelta(days=1)
     items = []
     for ticker in WATCHLIST:
-        r = requests.get(
-            "https://finnhub.io/api/v1/company-news",
-            params={"symbol": ticker, "from": start.isoformat(), "to": today.isoformat(),
-                    "token": os.environ["FINNHUB_API_KEY"]},
-            timeout=20,
-        )
-        r.raise_for_status()
-        for n in r.json():
+        try:
+            r = requests.get(
+                "https://finnhub.io/api/v1/company-news",
+                params={"symbol": ticker, "from": start.isoformat(), "to": today.isoformat(),
+                        "token": os.environ["FINNHUB_API_KEY"]},
+                timeout=20,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except requests.RequestException as e:
+            print(f"[finnhub] {ticker} sărit: {e}")
+            continue
+        for n in data:
             items.append({
                 "id": str(n["id"]),
                 "ticker": ticker,
@@ -97,7 +102,7 @@ def ask_gemini(text):
             "contents": [{"parts": [{"text": PROMPT + "\n\nȘtiri:\n" + text}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
         },
-        timeout=90,
+        timeout=60,
     )
     r.raise_for_status()
     return r.json()["candidates"][0]["content"]["parts"][0]["text"]
@@ -114,19 +119,43 @@ def ask_groq(text):
             "messages": [{"role": "system", "content": PROMPT},
                          {"role": "user", "content": "Știri:\n" + text}],
         },
-        timeout=90,
+        timeout=60,
     )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
 
-def ask_ai(text):
-    provider = os.getenv("AI_PROVIDER", AI_PROVIDER_DEFAULT).lower()
-    raw = ask_groq(text) if provider == "groq" else ask_gemini(text)
+def _parse(raw):
     start, end = raw.find("["), raw.rfind("]")
     if start == -1 or end == -1:
         raise ValueError(f"Răspunsul AI nu conține o listă JSON:\n{raw[:500]}")
     return json.loads(raw[start:end + 1])
+
+
+def ask_ai(text):
+    """Încearcă providerul principal cu retry, apoi celălalt ca fallback.
+    Întoarce None dacă toate au eșuat (rularea nu mai pică)."""
+    primary = os.getenv("AI_PROVIDER", AI_PROVIDER_DEFAULT).lower()
+    order = ["groq", "gemini"] if primary == "groq" else ["gemini", "groq"]
+    funcs = {"gemini": (ask_gemini, "GEMINI_API_KEY"), "groq": (ask_groq, "GROQ_API_KEY")}
+
+    for name in order:
+        fn, key = funcs[name]
+        if not os.getenv(key):
+            continue
+        for attempt in range(3):
+            try:
+                return _parse(fn(text))
+            except requests.HTTPError as e:
+                code = e.response.status_code if e.response is not None else None
+                body = e.response.text[:300] if e.response is not None else ""
+                print(f"[{name}] HTTP {code} (încercarea {attempt + 1}): {body}")
+                if code not in (429, 500, 502, 503, 504):
+                    break  # eroare permanentă (cheie greșită, model inexistent) -> trecem la fallback
+            except (requests.Timeout, requests.ConnectionError, ValueError, KeyError) as e:
+                print(f"[{name}] {type(e).__name__} (încercarea {attempt + 1}): {e}")
+            time.sleep(10 * (attempt + 1))
+    return None
 
 
 # ---------------- Telegram ----------------
@@ -204,7 +233,12 @@ def main():
          for n in batch],
         ensure_ascii=False,
     )
-    analyses = {str(a.get("id")): a for a in ask_ai(payload)}
+    result = ask_ai(payload)
+    if result is None:
+        # AI indisponibil: nu marcăm știrile ca văzute, le reîncercăm la rularea următoare.
+        print("AI indisponibil pe toți providerii. Reîncerc la următoarea rulare.")
+        return
+    analyses = {str(a.get("id")): a for a in result}
 
     sent = []
     for n in batch:
