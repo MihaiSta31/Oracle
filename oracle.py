@@ -93,8 +93,8 @@ def fetch_news():
 
 
 # ---------------- AI ----------------
-def ask_gemini(text):
-    model = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+def ask_gemini(text, model=None):
+    model = model or os.getenv("GEMINI_MODEL", "gemini-flash-latest")
     r = requests.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},
@@ -136,12 +136,15 @@ def ask_ai(text):
     """Încearcă providerul principal cu retry, apoi celălalt ca fallback.
     Întoarce None dacă toate au eșuat (rularea nu mai pică)."""
     primary = os.getenv("AI_PROVIDER", AI_PROVIDER_DEFAULT).lower()
-    order = ["groq", "gemini"] if primary == "groq" else ["gemini", "groq"]
-    funcs = {"gemini": (ask_gemini, "GEMINI_API_KEY"), "groq": (ask_groq, "GROQ_API_KEY")}
+    gemini_models = [os.getenv("GEMINI_MODEL", "gemini-flash-latest"),
+                     os.getenv("GEMINI_FALLBACK_MODEL", "gemini-flash-lite-latest")]
+    gemini = [(f"gemini:{m}", (lambda t, m=m: ask_gemini(t, m)), "GEMINI_API_KEY") for m in gemini_models]
+    groq = [("groq", ask_groq, "GROQ_API_KEY")]
+    chain = groq + gemini if primary == "groq" else gemini + groq
 
-    for name in order:
-        fn, key = funcs[name]
+    for name, fn, key in chain:
         if not os.getenv(key):
+            print(f"[{name}] sărit: lipsește {key}")
             continue
         for attempt in range(3):
             try:
@@ -154,7 +157,8 @@ def ask_ai(text):
                     break  # eroare permanentă (cheie greșită, model inexistent) -> trecem la fallback
             except (requests.Timeout, requests.ConnectionError, ValueError, KeyError) as e:
                 print(f"[{name}] {type(e).__name__} (încercarea {attempt + 1}): {e}")
-            time.sleep(10 * (attempt + 1))
+            if attempt < 2:
+                time.sleep(10 * (attempt + 1))
     return None
 
 
